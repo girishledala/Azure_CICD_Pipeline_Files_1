@@ -4,13 +4,13 @@ name: Build, Validate & Deploy Static Site
 # deploy job runs only after a PR is merged into main
 on:
   pull_request:
-    branches: [ main ]
+    branches: [main]
   push:
-    branches: [ main ]
-  workflow_dispatch: {}   # lets you trigger a manual re-deploy from the Actions tab
+    branches: [main]
+  workflow_dispatch: {} # lets you trigger a manual re-deploy from the Actions tab
 
 permissions:
-  id-token: write   # required so azure/login can request an OIDC token
+  id-token: write # required so azure/login can request an OIDC token
   contents: read
 
 env:
@@ -19,7 +19,6 @@ env:
   LB_PUBLIC_IP_NAME: pip-lb-app
   VM_USER: azureuser
   VM1_NAME: vm-app-01
-  VM2_NAME: vm-app-02
 
 jobs:
   # ---------------------------------------------------------------

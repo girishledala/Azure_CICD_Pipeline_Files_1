@@ -10,11 +10,10 @@
 set -euo pipefail
 
 # ---- EDIT THESE ----
-GITHUB_ORG="your-github-username-or-org"
-GITHUB_REPO="your-repo-name"
+GITHUB_ORG="girishledala"
+GITHUB_REPO="Azure_CICD_Pipeline_Files_1"
 RESOURCE_GROUP="rg-app-prod"
 VM1_NAME="vm-app-01"
-VM2_NAME="vm-app-02"
 VM_USER="azureuser"
 APP_NAME="gh-actions-deploy-cicd"
 # ---------------------
