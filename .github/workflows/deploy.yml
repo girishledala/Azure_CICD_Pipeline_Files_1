@@ -4,13 +4,13 @@ name: Build, Validate & Deploy Static Site
 # deploy job runs only after a PR is merged into main
 on:
   pull_request:
-    branches: [main]
+    branches: [ main ]
   push:
-    branches: [main]
-  workflow_dispatch: {} # lets you trigger a manual re-deploy from the Actions tab
+    branches: [ main ]
+  workflow_dispatch: {}   # lets you trigger a manual re-deploy from the Actions tab
 
 permissions:
-  id-token: write # required so azure/login can request an OIDC token
+  id-token: write   # required so azure/login can request an OIDC token
   contents: read
 
 env:
@@ -19,6 +19,7 @@ env:
   LB_PUBLIC_IP_NAME: pip-lb-app
   VM_USER: azureuser
   VM1_NAME: vm-app-01
+  VM2_NAME: vm-app-02
 
 jobs:
   # ---------------------------------------------------------------
@@ -68,29 +69,59 @@ jobs:
       - name: Deploy site to vm-app-01 and vm-app-02 (via Bastion tunnel)
         run: |
           set -e
-          SSH_OPTS="-i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          SSH_OPTS="-i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
 
           for VM in "$VM1_NAME" "$VM2_NAME"; do
             echo "=== Deploying to $VM ==="
             VM_ID=$(az vm show -g "$RESOURCE_GROUP" -n "$VM" --query id -o tsv)
+            if [ -z "$VM_ID" ]; then
+              echo "::error::az vm show returned no ID for $VM — check the VM name and that this identity has Reader on it."
+              exit 1
+            fi
 
             # Open a private tunnel through Bastion: localhost:2222 -> the VM's port 22.
             # This works even though the VM has no public IP — the tunnel rides over
             # Azure's control-plane HTTPS endpoint, authenticated by the OIDC login above.
+            # Its own output is captured to a log file since it runs in the background.
+            rm -f tunnel.log
             az network bastion tunnel \
               --name "$BASTION_NAME" \
               --resource-group "$RESOURCE_GROUP" \
               --target-resource-id "$VM_ID" \
-              --resource-port 22 --port 2222 &
+              --resource-port 22 --port 2222 > tunnel.log 2>&1 &
             TUNNEL_PID=$!
-            sleep 8   # give the tunnel a few seconds to come up before using it
+
+            # Poll for the local port instead of guessing with a fixed sleep — first
+            # connection through a fresh tunnel can take anywhere from 2 to 20+ seconds.
+            echo "Waiting for the Bastion tunnel to come up..."
+            TUNNEL_UP=0
+            for i in $(seq 1 30); do
+              if (exec 3<>/dev/tcp/127.0.0.1/2222) 2>/dev/null; then
+                exec 3<&- 3>&-
+                TUNNEL_UP=1
+                break
+              fi
+              # Bail out early if the az process already died instead of waiting the full timeout
+              if ! kill -0 $TUNNEL_PID 2>/dev/null; then
+                break
+              fi
+              sleep 2
+            done
+
+            if [ "$TUNNEL_UP" != "1" ]; then
+              echo "::error::Bastion tunnel to $VM never came up. Output from 'az network bastion tunnel':"
+              cat tunnel.log
+              kill $TUNNEL_PID 2>/dev/null || true
+              exit 1
+            fi
+            echo "Tunnel is up."
 
             ssh $SSH_OPTS -p 2222 $VM_USER@127.0.0.1 "mkdir -p /tmp/site-deploy"
             scp $SSH_OPTS -P 2222 -r src/* $VM_USER@127.0.0.1:/tmp/site-deploy/
             ssh $SSH_OPTS -p 2222 $VM_USER@127.0.0.1 \
               "sudo mkdir -p /var/www/html && sudo cp -r /tmp/site-deploy/* /var/www/html/ && sudo rm -rf /tmp/site-deploy && sudo systemctl reload nginx"
 
-            kill $TUNNEL_PID
+            kill $TUNNEL_PID 2>/dev/null || true
             echo "=== $VM done ==="
           done
 
