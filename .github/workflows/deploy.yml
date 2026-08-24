@@ -1,0 +1,108 @@
+name: Build, Validate & Deploy Static Site
+
+# validate job runs on every PR (safe: never touches the servers)
+# deploy job runs only after a PR is merged into main
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}   # lets you trigger a manual re-deploy from the Actions tab
+
+permissions:
+  id-token: write   # required so azure/login can request an OIDC token
+  contents: read
+
+env:
+  RESOURCE_GROUP: rg-app-prod
+  BASTION_NAME: bas-app-prod
+  LB_PUBLIC_IP_NAME: pip-lb-app
+  VM_USER: azureuser
+  VM1_NAME: vm-app-01
+  VM2_NAME: vm-app-02
+
+jobs:
+  # ---------------------------------------------------------------
+  # Runs on EVERY pull request. No Azure access, no secrets used.
+  # ---------------------------------------------------------------
+  validate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check that index.html exists and is well-formed
+        run: |
+          test -f src/index.html
+          # basic sanity check - fails the build on obviously broken markup
+          grep -q "<html" src/index.html
+          grep -q "</html>" src/index.html
+          echo "Static site files look OK."
+
+  # ---------------------------------------------------------------
+  # Runs only on push to main (i.e. right after a PR is merged).
+  # ---------------------------------------------------------------
+  deploy:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC — no client secret stored)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install the Azure Bastion CLI extension
+        run: az extension add --name bastion --only-show-errors
+
+      - name: Write the deploy SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Deploy site to vm-app-01 and vm-app-02 (via Bastion tunnel)
+        run: |
+          set -e
+          SSH_OPTS="-i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+          for VM in "$VM1_NAME" "$VM2_NAME"; do
+            echo "=== Deploying to $VM ==="
+            VM_ID=$(az vm show -g "$RESOURCE_GROUP" -n "$VM" --query id -o tsv)
+
+            # Open a private tunnel through Bastion: localhost:2222 -> the VM's port 22.
+            # This works even though the VM has no public IP — the tunnel rides over
+            # Azure's control-plane HTTPS endpoint, authenticated by the OIDC login above.
+            az network bastion tunnel \
+              --name "$BASTION_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --target-resource-id "$VM_ID" \
+              --resource-port 22 --port 2222 &
+            TUNNEL_PID=$!
+            sleep 8   # give the tunnel a few seconds to come up before using it
+
+            ssh $SSH_OPTS -p 2222 $VM_USER@127.0.0.1 "mkdir -p /tmp/site-deploy"
+            scp $SSH_OPTS -P 2222 -r src/* $VM_USER@127.0.0.1:/tmp/site-deploy/
+            ssh $SSH_OPTS -p 2222 $VM_USER@127.0.0.1 \
+              "sudo mkdir -p /var/www/html && sudo cp -r /tmp/site-deploy/* /var/www/html/ && sudo rm -rf /tmp/site-deploy && sudo systemctl reload nginx"
+
+            kill $TUNNEL_PID
+            echo "=== $VM done ==="
+          done
+
+      - name: Health check through the Load Balancer
+        run: |
+          sleep 5
+          LB_IP=$(az network public-ip show -g "$RESOURCE_GROUP" -n "$LB_PUBLIC_IP_NAME" --query ipAddress -o tsv)
+          echo "Checking http://$LB_IP ..."
+          curl -sf "http://$LB_IP" || (echo "Health check failed against $LB_IP" && exit 1)
+          echo "Deployment verified via the Load Balancer."
+
+      - name: Clean up the SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
